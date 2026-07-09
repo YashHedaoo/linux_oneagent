@@ -1,0 +1,20 @@
+# Copy to terraform.tfvars for LOCAL runs only. Do NOT commit terraform.tfvars
+# (it is gitignored). In CI these come from GitHub Actions secrets instead.
+
+dt_environment_url = "https://abc12345.live.dynatrace.com"
+dt_paas_token      = "dt0c01.XXXXXXXX.YYYYYYYY"
+
+target_hosts = ["10.0.0.10", "10.0.0.11"]
+ssh_user     = "ubuntu"
+ssh_port     = 22
+
+# Paste the private key contents, or use: ssh_private_key = file("~/.ssh/id_rsa")
+ssh_private_key = <<-EOT
+-----BEGIN OPENSSH PRIVATE KEY-----
+...
+-----END OPENSSH PRIVATE KEY-----
+EOT
+
+arch             = "x86"
+installer_flags  = "--set-infra-only=false --set-app-log-content-access=true"
+verify_signature = true

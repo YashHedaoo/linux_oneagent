@@ -1,0 +1,57 @@
+name: Deploy Dynatrace OneAgent
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**.tf"
+      - "scripts/**"
+      - ".github/workflows/deploy.yml"
+  pull_request:
+    paths:
+      - "**.tf"
+      - "scripts/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+
+    # Terraform reads TF_VAR_<name> env vars automatically. Secrets are stored in
+    # the repo/environment: Settings -> Secrets and variables -> Actions.
+    env:
+      TF_VAR_dt_environment_url: ${{ secrets.DT_ENVIRONMENT_URL }}
+      TF_VAR_dt_paas_token: ${{ secrets.DT_PAAS_TOKEN }}
+      TF_VAR_ssh_user: ${{ secrets.SSH_USER }}
+      TF_VAR_ssh_private_key: ${{ secrets.SSH_PRIVATE_KEY }}
+      # A JSON array string, e.g. '["10.0.0.10","10.0.0.11"]'
+      TF_VAR_target_hosts: ${{ secrets.TARGET_HOSTS }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.5"
+
+      - name: Terraform Init
+        run: terraform init -input=false
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        run: terraform plan -input=false -no-color
+
+      # Only apply on pushes to main (not on PRs).
+      - name: Terraform Apply
+        if: github.event_name != 'pull_request'
+        run: terraform apply -auto-approve -input=false -no-color
