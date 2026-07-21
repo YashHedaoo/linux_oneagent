@@ -253,17 +253,11 @@ think about.
 | `target_hosts` | List of servers you want to install on | `["srv-app-01", "192.168.1.10"]` |
 | `ssh_private_key` | The PEM private key for SSH. Use `file("...")` so the key isn't pasted inline. | `file("~/.ssh/id_ed25519")` |
 
-### Optional — defaults work for most setups
-
-| Variable | Default | Set this when... |
-|---|---|---|
-| `ssh_user` | `ubuntu` | Your SSH user isn't `ubuntu` (e.g. `ec2-user`, `ansible`) |
-| `arch` | `x86` | Your servers are ARM, PowerPC, or s390 |
-| `installer_flags` | `--set-infra-only=false --set-app-log-content-access=true` | You need host tags, host groups, proxy settings, or process filters. See [common flags](#common-installer-flags). |
-| `apply_parallelism` | `10` | You have a huge fleet, or your tenant rate-limits connections. Lower = safer, slower. Higher = faster, riskier. |
-
-> **Air-gapped network** (targets can't reach the internet)? See [Scenario D](#scenario-d--air-gapped-network-no-internet-from-targets).
-> **Need a bastion / jump host**? See [Scenario A](#scenario-a--run-it-from-github-actions) — the bastion variables are documented in `variables.tf`.
+> **All other variables have sensible defaults** (e.g. SSH user is `ubuntu`,
+> installer runs full-stack with log access enabled). You only need to set
+> them if your environment is non-standard — see `variables.tf` for the full
+> list, and [common flags](#common-installer-flags) below for the most useful
+> customizations.
 
 ### Common installer flags
 
@@ -321,9 +315,9 @@ Go to your repo → **Settings** → **Secrets and variables** → **Actions** �
 |---|---|---|
 | `DT_ENVIRONMENT_URL` | Your tenant URL, e.g. `https://abc12345.live.dynatrace.com` | ✅ |
 | `DT_PAAS_TOKEN` | PaaS token from Step 2 of the quick start | ✅ |
-| `SSH_USER` | SSH user on targets (e.g. `ubuntu`) | ✅ |
 | `SSH_PRIVATE_KEY` | Full PEM contents of the SSH private key (including the `-----BEGIN/END-----` lines) | ✅ |
 | `TARGET_HOSTS` | JSON array string: `["srv-app-01","192.168.10.50"]` | ✅ (or pass via UI) |
+| `SSH_USER` | SSH user on targets. Only set if your user is NOT `ubuntu`. | Optional (defaults to `ubuntu`) |
 | `BASTION_HOST` | FQDN/IP of jump host | Only if using a bastion |
 | `BASTION_USER` | SSH user on bastion | Only if using a bastion (defaults to `SSH_USER`) |
 | `BASTION_PRIVATE_KEY` | PEM key for bastion | Only if using a bastion (defaults to `SSH_PRIVATE_KEY`) |

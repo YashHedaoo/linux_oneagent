@@ -53,7 +53,7 @@ jobs:
     env:
       TF_VAR_dt_environment_url: ${{ secrets.DT_ENVIRONMENT_URL }}
       TF_VAR_dt_paas_token: ${{ secrets.DT_PAAS_TOKEN }}
-      TF_VAR_ssh_user: ${{ secrets.SSH_USER }}
+      TF_VAR_ssh_user: ${{ secrets.SSH_USER || 'ubuntu' }}
       TF_VAR_ssh_private_key: ${{ secrets.SSH_PRIVATE_KEY }}
       TF_VAR_bastion_host: ${{ secrets.BASTION_HOST }}
       TF_VAR_bastion_user: ${{ secrets.BASTION_USER }}
