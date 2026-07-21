@@ -1,20 +1,55 @@
-# Copy to terraform.tfvars for LOCAL runs only. Do NOT commit terraform.tfvars
-# (it is gitignored). In CI these come from GitHub Actions secrets instead.
+# =============================================================================
+# Copy this file to terraform.tfvars for LOCAL runs only.
+# NEVER commit terraform.tfvars (it should be in .gitignore).
+# In CI these values come from GitHub Actions secrets — see README.md.
+# =============================================================================
 
-dt_environment_url = "https://abc12345.live.dynatrace.com"
-dt_paas_token      = "dt0c01.XXXXXXXX.YYYYYYYY"
+# ---- Dynatrace connection ------------------------------------------------
+dt_environment_url = "https://abc12345.live.dynatrace.com"   # or Managed ActiveGate URL
+dt_paas_token      = "dt0c01.XXXXXXXX.YYYYYYYY"              # Dynatrace → Deploy Dynatrace → PaaS token
 
-target_hosts = ["10.0.0.10", "10.0.0.11"]
-ssh_user     = "ubuntu"
-ssh_port     = 22
+# ---- Target servers (on-prem) -------------------------------------------
+target_hosts = [
+  "srv-app-01.internal.company.com",
+  "192.168.10.50",
+]
 
-# Paste the private key contents, or use: ssh_private_key = file("~/.ssh/id_rsa")
+# ---- SSH access ----------------------------------------------------------
+ssh_user = "ubuntu"                                            # must have passwordless sudo
+ssh_port = 22
+
+# Prefer file() so the key never lives in tfvars plaintext:
+#   ssh_private_key = file("~/.ssh/id_ed25519")
+# Or paste a heredoc (less safe — easy to leak):
 ssh_private_key = <<-EOT
 -----BEGIN OPENSSH PRIVATE KEY-----
-...
+... redacted ...
 -----END OPENSSH PRIVATE KEY-----
 EOT
 
-arch             = "x86"
+# ---- Installer behaviour -------------------------------------------------
+arch             = "x86"          # x86 | arm | ppcle | s390
 installer_flags  = "--set-infra-only=false --set-app-log-content-access=true"
-verify_signature = true
+verify_signature = true           # strongly recommended for prod
+
+# ---- Tuning --------------------------------------------------------------
+ssh_timeout       = "5m"          # per-host timeout
+apply_parallelism = 10            # max hosts to install on concurrently
+
+# ---- Air-gapped / offline (uncomment if applicable) ----------------------
+# Use these when targets can't reach your Dynatrace tenant OR ca.dynatrace.com.
+# After uncommenting, set verify_signature = true for cert to actually be used.
+
+# Path to a local copy of the Dynatrace root cert. If unset, the install
+# script will try to download it from https://ca.dynatrace.com/.
+# local_cert_path = "./certs/dt-root.cert.pem"
+
+# Path to a pre-downloaded OneAgent installer. If unset, the install script
+# downloads the latest from ${dt_environment_url}.
+# local_installer_path = "./installers/Dynatrace-OneAgent-Linux.sh"
+
+# ---- On-Prem SSH Bastion / Jump Host (uncomment if you need one) ---------
+# bastion_host        = "bastion.company.com"
+# bastion_user        = "bastionuser"      # defaults to ssh_user
+# bastion_private_key = file("~/.ssh/id_ed25519_bastion")
+# bastion_port        = 22

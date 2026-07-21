@@ -12,23 +12,53 @@ on:
       - "**.tf"
       - "scripts/**"
   workflow_dispatch:
+    inputs:
+      target_hosts:
+        description: 'Server Hostname(s) or IP(s) to install on (e.g. srv-app-01.internal or ["192.168.1.10","192.168.1.11"]). Leave blank to use TARGET_HOSTS secret.'
+        required: false
+        type: string
+        default: ''
+      runner:
+        description: 'GitHub Runner type (ubuntu-latest for cloud + bastion, self-hosted for internal network)'
+        required: true
+        type: choice
+        options:
+          - ubuntu-latest
+          - self-hosted
+        default: ubuntu-latest
+      installer_flags:
+        description: 'Custom installer flags (optional)'
+        required: false
+        type: string
+        default: '--set-infra-only=false --set-app-log-content-access=true'
+      apply_parallelism:
+        description: 'Max hosts to install on in parallel (1-50).'
+        required: false
+        type: number
+        default: 10
 
 permissions:
   contents: read
 
 jobs:
   terraform:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
 
-    # Terraform reads TF_VAR_<name> env vars automatically. Secrets are stored in
-    # the repo/environment: Settings -> Secrets and variables -> Actions.
+    # Protect prod with a manual approval gate. Configure required reviewers
+    # under Settings → Environments → production in your GitHub repo.
+    environment:
+      name: production
+      url: https://app.dynatrace.com
+
     env:
       TF_VAR_dt_environment_url: ${{ secrets.DT_ENVIRONMENT_URL }}
       TF_VAR_dt_paas_token: ${{ secrets.DT_PAAS_TOKEN }}
       TF_VAR_ssh_user: ${{ secrets.SSH_USER }}
       TF_VAR_ssh_private_key: ${{ secrets.SSH_PRIVATE_KEY }}
-      # A JSON array string, e.g. '["10.0.0.10","10.0.0.11"]'
-      TF_VAR_target_hosts: ${{ secrets.TARGET_HOSTS }}
+      TF_VAR_bastion_host: ${{ secrets.BASTION_HOST }}
+      TF_VAR_bastion_user: ${{ secrets.BASTION_USER }}
+      TF_VAR_bastion_private_key: ${{ secrets.BASTION_PRIVATE_KEY }}
+      TF_VAR_apply_parallelism: ${{ inputs.apply_parallelism || 10 }}
 
     steps:
       - name: Checkout
@@ -38,6 +68,30 @@ jobs:
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.9.5"
+
+      - name: Parse Target Hosts & Inputs
+        run: |
+          INPUT_HOSTS="${{ inputs.target_hosts }}"
+          SECRET_HOSTS='${{ secrets.TARGET_HOSTS }}'
+          RAW_HOSTS="${INPUT_HOSTS:-$SECRET_HOSTS}"
+
+          if [ -z "$RAW_HOSTS" ]; then
+            echo "Error: No target hosts specified in workflow input or TARGET_HOSTS secret!"
+            exit 1
+          fi
+
+          # Format plain hostname or comma-separated list into JSON array if needed
+          if [[ "$RAW_HOSTS" != \[* ]]; then
+            CLEAN_JSON=$(echo "$RAW_HOSTS" | awk -F',' '{for(i=1;i<=NF;i++){gsub(/^[ \t]+|[ \t]+$/, "", $i); printf "%s\"%s\"", (i==1?"":", "), $i}}')
+            RAW_HOSTS="[$CLEAN_JSON]"
+          fi
+
+          echo "Target Hosts: $RAW_HOSTS"
+          echo "TF_VAR_target_hosts=$RAW_HOSTS" >> $GITHUB_ENV
+
+          if [ -n "${{ inputs.installer_flags }}" ]; then
+            echo "TF_VAR_installer_flags=${{ inputs.installer_flags }}" >> $GITHUB_ENV
+          fi
 
       - name: Terraform Init
         run: terraform init -input=false
@@ -49,9 +103,13 @@ jobs:
         run: terraform validate
 
       - name: Terraform Plan
-        run: terraform plan -input=false -no-color
+        run: terraform plan -input=false -no-color -lock-timeout=5m
 
-      # Only apply on pushes to main (not on PRs).
+      # Only apply on pushes to main or manual workflow_dispatch triggers.
+      # Pull requests always stop after plan. Production approval gate is
+      # enforced via the job-level `environment: production` above.
       - name: Terraform Apply
         if: github.event_name != 'pull_request'
-        run: terraform apply -auto-approve -input=false -no-color
+        run: |
+          PARALLELISM="${{ env.TF_VAR_apply_parallelism || 10 }}"
+          terraform apply -auto-approve -input=false -no-color -lock-timeout=5m -parallelism=${PARALLELISM}
