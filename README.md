@@ -1,288 +1,432 @@
 # Install Dynatrace OneAgent on On-Premises Linux Servers
 
-> **Welcome!** This repo automates the installation of
-> [Dynatrace OneAgent](https://docs.dynatrace.com/docs/ingest-from/dynatrace-oneagent/installation-and-operation/linux/installation/install-oneagent-on-linux)
-> on existing Linux servers that we cannot reach through any cloud-managed
-> mechanism (no SSM, no GCE guest agent, etc.).
->
-> If you are new here, **read sections 1–4 in order, then jump to whichever
-> scenario in section 6 matches your work**.
+This repository installs [Dynatrace OneAgent](https://docs.dynatrace.com/docs/ingest-from/dynatrace-oneagent)
+on Linux servers inside your own data center ("on-premises") using Terraform
+and GitHub Actions. OneAgent is Dynatrace's small program that runs on each
+server and reports host, process, and application data back to your Dynatrace
+tenant.
+
+**Who this is for:** platform engineers who need to push OneAgent to a fleet
+of on-prem Linux boxes that you cannot reach through any cloud-native tool
+(no AWS SSM, no GCE guest agent, etc.) — only SSH.
 
 ---
 
 ## Table of Contents
 
-1. [What this repo does (and does not do)](#1-what-this-repo-does-and-does-not-do)
-2. [How it works](#2-how-it-works)
-3. [Repository layout](#3-repository-layout)
-4. [First-time setup](#4-first-time-setup)
+1. [Which path should I follow?](#1-which-path-should-i-follow)
+2. [The 30-minute quick start](#2-the-30-minute-quick-start)
+3. [How it works](#3-how-it-works)
+4. [Files in this repository](#4-files-in-this-repository)
 5. [Configuration reference](#5-configuration-reference)
-6. [Common scenarios](#6-common-scenarios)
+6. [Scenarios](#6-scenarios)
 7. [Security model](#7-security-model)
-8. [Operations & troubleshooting](#8-operations--troubleshooting)
+8. [Operations and troubleshooting](#8-operations-and-troubleshooting)
 9. [FAQ](#9-faq)
-10. [Glossary](#10-glossary)
 
 ---
 
-## 1. What this repo does (and does not do)
+## 1. Which path should I follow?
 
-**Does**
-- Open an SSH connection to each on-prem Linux server you list
-- Upload a small install script
-- Run the script as root to download (or use a pre-staged) OneAgent installer,
-  cryptographically verify its signature, and install it
-- Clean up after itself — no installers left on the target
+Pick the row that matches your situation, then jump to that section.
 
-**Does NOT**
-- Provision or decommission servers
-- Configure firewalls / DNS / routing
-- Manage the Dynatrace tenant itself (you create the PaaS token outside this repo)
-- Work without SSH access from the runner to the targets
-
-If you need a one-off install on a single box with no automation, see the
-[Manual install recipe](#manual-single-host-install) at the bottom — you don't
-need this repo for that.
+| Your situation | Go to |
+|---|---|
+| I just want it running on a few boxes. No automation, no CI. | [Quick start](#2-the-30-minute-quick-start) |
+| I want to trigger installs from the GitHub web UI. | [Scenario A](#scenario-a--run-it-from-github-actions) |
+| I want installs to happen automatically when code changes. | [Scenario B](#scenario-b--auto-run-on-push-to-main) |
+| I want to run Terraform from my laptop. | [Scenario C](#scenario-c--run-terraform-locally) |
+| My target servers cannot reach the internet. | [Scenario D](#scenario-d--air-gapped-network-no-internet-from-targets) |
+| I only need to install on ONE box, once. | [Manual one-liner](#manual-one-liner-single-host) at the bottom of §6 |
+| I'm new and want to understand the moving parts first. | [How it works](#3-how-it-works) |
 
 ---
 
-## 2. How it works
+## 2. The 30-minute quick start
 
-```
-                          ┌───────────────────────────┐
-                          │  GitHub Actions workflow   │
-                          │  (deploy.yml)              │
-                          └─────────────┬─────────────┘
-                                        │  terraform init/plan/apply
-                                        ▼
-                          ┌───────────────────────────┐
-                          │   null_resource.oneagent  │
-                          │   (one per target host)   │
-                          └─────────────┬─────────────┘
-                                        │  SSH (optionally via Bastion)
-                                        ▼
-        ┌─────────────────────────────────────────────────────┐
-        │  scripts/install_oneagent.sh  (runs as root)       │
-        │   1. Skip if OneAgent is already running            │
-        │   2. Download installer OR use DT_LOCAL_INSTALLER  │
-        │   3. Verify PKCS7 signature vs Dynatrace root cert │
-        │   4. Run installer with DT_INSTALLER_FLAGS         │
-        │   5. Clean up                                       │
-        └─────────────────────────────────────────────────────┘
+> Goal: install OneAgent on your first on-prem Linux server using this repo,
+> in 30 minutes or less. After this works, scale up.
+
+### Step 1 — Install Terraform on your machine (2 min)
+
+You need Terraform version 1.5 or newer.
+
+```bash
+# macOS
+brew install terraform
+
+# Linux (Debian/Ubuntu)
+sudo apt-get update && sudo apt-get install -y terraform
+
+# Or grab the binary directly: https://developer.hashicorp.com/terraform/install
 ```
 
-Key properties:
-
-| Property | How |
-|---|---|
-| **Idempotent** | `install_oneagent.sh` checks `systemctl is-active oneagent` and an active process before doing anything |
-| **Signed installer** | PKCS7 verification against Dynatrace's root CA cert (toggleable but on by default) |
-| **Air-gapped ready** | Ship a local cert (`local_cert_path`) and/or pre-downloaded installer (`local_installer_path`) |
-| **Bastion-aware** | Optional SSH jump host via `bastion_*` variables |
-| **No secret leaks** | PaaS token never appears on any process command line — passed via shell env across the sudo boundary |
-| **Production gate** | GitHub Actions `environment: production` blocks apply until reviewers approve |
-
----
-
-## 3. Repository layout
-
-| File | Purpose |
-|---|---|
-| `versions.tf` | Terraform + provider versions, **state backend examples** (pick one — local backend is fine for solo work) |
-| `variables.tf` | All inputs — no required secrets are hardcoded |
-| `main.tf` | One `null_resource` per host: SSH, pre-flight check, uploads script/artifacts, runs installer |
-| `outputs.tf` | Prints the list of hosts and the tenant URL after apply |
-| `scripts/install_oneagent.sh` | The actual installer (download → verify → install → cleanup) |
-| `terraform.tfvars.example` | Template for local runs — copy to `terraform.tfvars` and edit |
-| `.github/workflows/deploy.yml` | CI pipeline: PR → plan, push to main → apply with approval |
-
----
-
-## 4. First-time setup
-
-> **Time estimate: 20–30 minutes.** You will need a Dynatrace tenant URL, a
-> PaaS token, and SSH access to at least one target server.
-
-### 4.1 Install local tools
-- [Terraform](https://developer.hashicorp.com/terraform/install) ≥ 1.5
-- An SSH client (built into macOS / Linux; use OpenSSH on Windows)
-
-Verify:
+Verify it works:
 ```bash
 terraform version
-ssh -V
+# Expected: Terraform v1.5.x or higher
 ```
 
-### 4.2 Get a Dynatrace PaaS token
-1. Log into your Dynatrace tenant (e.g. `https://abc12345.live.dynatrace.com`)
-2. Go to **Deploy Dynatrace → Start installation → Linux**
-3. Copy the **PaaS token** (starts with `dt0c01.`)
-4. Note your environment URL — copy it **without** a trailing `/api`
+### Step 2 — Grab a Dynatrace PaaS token (3 min)
 
-### 4.3 Verify SSH + sudo on at least one target
-You need an SSH user who can `sudo -n true` (no password prompt). Confirm:
+A "PaaS token" is a Dynatrace API token that lets you download the OneAgent
+installer.
+
+1. Open your Dynatrace tenant (the URL looks like
+   `https://abc12345.live.dynatrace.com`).
+2. In the left menu: **Deploy Dynatrace** → **Start installation** → **Linux**.
+3. You'll see a PaaS token. It starts with `dt0c01.`. Copy it.
+4. Also note your **environment URL** (the web address of your tenant).
+   Copy it **without** a trailing `/api`.
+
+Keep these two values handy — you'll paste them in Step 4.
+
+### Step 3 — Confirm you can SSH to your target (3 min)
+
+Pick one Linux server you want to test on. You need an SSH user that can run
+`sudo` without typing a password (this is called "passwordless sudo").
+
 ```bash
-ssh ubuntu@srv-app-01 sudo -n true
-echo "sudo OK"   # if you see this, you're good
+ssh ubuntu@your-server-ip
+sudo -n true
+echo "sudo OK"      # if you see this, you're good
 ```
 
-If sudo prompts for a password, ask the server owner to add a NOPASSWD rule in
-`/etc/sudoers.d/` (e.g. `ubuntu ALL=(ALL) NOPASSWD: ALL` for non-prod hosts).
+If `sudo` asks for a password, ask the server owner to add this file
+(`/etc/sudoers.d/ubuntu-nopasswd`):
 
-### 4.4 Clone and configure
+```
+ubuntu ALL=(ALL) NOPASSWD: ALL
+```
+
+Then log out and log back in.
+
+### Step 4 — Clone and configure (5 min)
+
 ```bash
-git clone <your-fork-url> tf_linux_oneagent
+git clone <repo-url> tf_linux_oneagent
 cd tf_linux_oneagent
 
 cp terraform.tfvars.example terraform.tfvars
-$EDITOR terraform.tfvars       # fill in dt_environment_url, target_hosts, ssh_* etc.
 ```
 
-### 4.5 Dry-run
+Open `terraform.tfvars` in your editor and fill in at minimum:
+
+```hcl
+dt_environment_url = "https://abc12345.live.dynatrace.com"   # your tenant
+dt_paas_token      = "dt0c01.YOUR_TOKEN_HERE"               # from Step 2
+target_hosts       = ["your-server-ip"]                     # from Step 3
+ssh_private_key    = file("~/.ssh/id_ed25519")              # path to your SSH key
+```
+
+Save the file. **Never commit `terraform.tfvars` to git** — it should be in
+your `.gitignore` (it already is in this repo).
+
+### Step 5 — Preview the install (2 min)
+
 ```bash
-terraform init
-terraform plan
+terraform init        # downloads the Terraform providers
+terraform plan        # shows what would happen, without changing anything
 ```
 
-Read the plan output — you should see one `null_resource.oneagent["<host>"]`
-per host in your `target_hosts` list. If you see zero resources, your
-`target_hosts` is empty.
+You should see output like:
 
-### 4.6 Apply
+```
+Plan: 1 to add, 0 to change, 0 to destroy.
+```
+
+That "1 to add" is the install operation for your one test server. If you see
+"0 to add", your `target_hosts` list is empty.
+
+### Step 6 — Install for real (5 min)
+
 ```bash
 terraform apply
 ```
 
-You should see, per host:
+Type `yes` when prompted. You'll see (roughly):
+
 ```
-null_resource.oneagent["srv-app-01"]: Creating...
-null_resource.oneagent["srv-app-01"]: Provisioning with remote-exec...
-==> Pre-flight: verifying passwordless sudo on srv-app-01
+null_resource.oneagent["your-server-ip"]: Creating...
+null_resource.oneagent["your-server-ip"]: Provisioning with remote-exec...
+==> Pre-flight: verifying passwordless sudo on your-server-ip
 ==> Pre-flight OK
-==> OneAgent already running — skipping install.   (or)   ==> Downloading OneAgent installer...
-...
-null_resource.oneagent["srv-app-01"]: Creation complete
+==> Downloading OneAgent installer (arch=x86)...
+==> Verifying installer signature...
+==> Signature OK.
+==> Running installer with flags: ...
+==> OneAgent installation complete.
+
+null_resource.oneagent["your-server-ip"]: Creation complete after 2m13s
+
+Apply complete! Resources: 1 added, 0 changed, 0 destroyed.
 ```
 
-### 4.7 Confirm in Dynatrace
-Within ~2 minutes, the host should appear in **Dynatrace → Hosts**.
+### Step 7 — Confirm it worked (1 min)
+
+Within 1–2 minutes, your server should appear in the Dynatrace UI under
+**Hosts**.
+
+You can also check on the server itself:
+
+```bash
+ssh ubuntu@your-server-ip systemctl status oneagent
+# Expected: Active: active (running)
+```
+
+**Done.** Now go to [Scenario A or B](#6-scenarios) to set up the GitHub
+Actions pipeline so your whole team can use this.
+
+---
+
+## 3. How it works
+
+Here's the flow when you trigger an install:
+
+```
+                       ┌──────────────────────────────┐
+                       │  GitHub Actions workflow     │
+                       │  (you click Run, or a push   │
+                       │   to main triggers it)       │
+                       └──────────────┬───────────────┘
+                                      │ runs Terraform
+                                      ▼
+                       ┌──────────────────────────────┐
+                       │  One "null_resource" per     │
+                       │  target host in main.tf      │
+                       └──────────────┬───────────────┘
+                                      │ opens an SSH connection
+                                      │ (optionally via a bastion)
+                                      ▼
+        ┌─────────────────────────────────────────────────────────┐
+        │  scripts/install_oneagent.sh  — runs as root on target │
+        │   1. Check if OneAgent is already running. If yes, stop.│
+        │   2. Download the installer (or use a pre-staged one). │
+        │   3. Verify the installer's PKCS7 cryptographic         │
+        │      signature against Dynatrace's root CA cert.        │
+        │   4. Run the installer with your flags.                │
+        │   5. Delete the installer and any temp files.          │
+        └─────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+                       Your server shows up in Dynatrace
+```
+
+### Key guarantees
+
+| Property | How it's enforced |
+|---|---|
+| **Safe to re-run** (idempotent) | The script checks if the `oneagent` service is already running before doing anything. Already-installed hosts are skipped. |
+| **Installer is authentic** | The installer is verified with a PKCS7 cryptographic signature against Dynatrace's root certificate. If verification fails, the install aborts. |
+| **Works without internet from targets** | You can pre-stage the certificate and/or installer and ship them to the target. |
+| **Works through a jump host** | Set the `bastion_*` variables and Terraform will hop through your jump host. |
+| **PaaS token never leaks** | The token is exported in the SSH session's environment and handed to `sudo` via `--preserve-env=<list>`. It never appears on any process command line (so `ps` can't see it). |
+| **Production is gated** | A GitHub `environment: production` approval step blocks `terraform apply` until a reviewer approves. |
+
+---
+
+## 4. Files in this repository
+
+| File | What it does |
+|---|---|
+| `versions.tf` | Declares the Terraform version we require and the `null` provider. Also has ready-to-use examples for state backends (S3, Azure Blob, GCS, Terraform Cloud) — pick one before going to production. |
+| `variables.tf` | All the inputs you can set. Required ones, defaults, and validation rules. |
+| `main.tf` | The actual work: one `null_resource` per host that opens SSH, runs pre-flight checks, uploads the script, and runs the installer. |
+| `outputs.tf` | Prints the list of hosts and the tenant URL after `terraform apply`. |
+| `scripts/install_oneagent.sh` | The shell script that runs on each target server to install OneAgent. You generally won't edit this. |
+| `terraform.tfvars.example` | A template file. Copy to `terraform.tfvars` for local runs. |
+| `.github/workflows/deploy.yml` | The GitHub Actions pipeline. Defines when Terraform runs and how secrets are passed in. |
 
 ---
 
 ## 5. Configuration reference
 
-All variables live in `variables.tf`. Summary:
+All variables live in `variables.tf`. Here are the ones you actually need to
+think about.
 
-### Required
-| Variable | Description | Example |
+### Required — you must set these
+
+| Variable | What it is | Example |
 |---|---|---|
-| `dt_environment_url` | Dynatrace tenant URL | `https://abc12345.live.dynatrace.com` |
-| `dt_paas_token` | PaaS token | `dt0c01.abc.xyz` |
-| `target_hosts` | List of hosts (IP or FQDN) | `["srv-app-01", "192.168.1.10"]` |
-| `ssh_private_key` | PEM contents of SSH key | `file("~/.ssh/id_ed25519")` |
+| `dt_environment_url` | Your Dynatrace tenant URL | `https://abc12345.live.dynatrace.com` |
+| `dt_paas_token` | Dynatrace PaaS API token (see Step 2) | `dt0c01.abc.xyz` |
+| `target_hosts` | List of servers you want to install on | `["srv-app-01", "192.168.1.10"]` |
+| `ssh_private_key` | The PEM private key for SSH. Use `file("...")` so the key isn't pasted inline. | `file("~/.ssh/id_ed25519")` |
 
-### Optional — common
-| Variable | Default | Description |
+### Optional — defaults work for most setups
+
+| Variable | Default | Set this when... |
 |---|---|---|
-| `ssh_user` | `ubuntu` | SSH user (must have passwordless sudo) |
-| `ssh_port` | `22` | SSH port |
-| `arch` | `x86` | `x86` / `arm` / `ppcle` / `s390` |
-| `installer_flags` | `--set-infra-only=false --set-app-log-content-access=true` | Passed to the installer |
-| `verify_signature` | `true` | Verify PKCS7 signature before installing |
-| `apply_parallelism` | `10` | Max concurrent installs |
-| `ssh_timeout` | `5m` | Per-host SSH timeout |
+| `ssh_user` | `ubuntu` | Your SSH user isn't `ubuntu` (e.g. `ec2-user`, `ansible`) |
+| `arch` | `x86` | Your servers are ARM, PowerPC, or s390 |
+| `installer_flags` | `--set-infra-only=false --set-app-log-content-access=true` | You need host tags, host groups, proxy settings, or process filters. See [common flags](#common-installer-flags). |
+| `apply_parallelism` | `10` | You have a huge fleet, or your tenant rate-limits connections. Lower = safer, slower. Higher = faster, riskier. |
 
-### Optional — air-gapped / offline
-| Variable | Default | Description |
-|---|---|---|
-| `local_cert_path` | `null` | Local copy of `dt-root.cert.pem`. Use when targets can't reach `ca.dynatrace.com`. |
-| `local_installer_path` | `null` | Pre-downloaded `Dynatrace-OneAgent-Linux.sh`. Use when targets can't reach the Dynatrace tenant. |
+> **Air-gapped network** (targets can't reach the internet)? See [Scenario D](#scenario-d--air-gapped-network-no-internet-from-targets).
+> **Need a bastion / jump host**? See [Scenario A](#scenario-a--run-it-from-github-actions) — the bastion variables are documented in `variables.tf`.
 
-### Optional — SSH bastion / jump host
-| Variable | Default | Description |
-|---|---|---|
-| `bastion_host` | `null` | FQDN/IP of the jump host |
-| `bastion_user` | `ssh_user` | SSH user on the bastion |
-| `bastion_private_key` | `ssh_private_key` | Key for the bastion |
-| `bastion_port` | `22` | Bastion SSH port |
+### Common installer flags
 
-### Installer flags you might want
+These get appended to the install command. Combine as needed:
+
 ```bash
-# Tag hosts by environment
+# Tag every host with environment and team metadata
 "--set-host-tag=env=production --set-host-tag=team=platform"
 
-# Group hosts for dashboards
+# Group hosts so they show up together in dashboards
 "--set-host-group=Production-Linux-Servers"
 
-# Monitor specific processes
+# Only monitor specific processes (faster, less data)
 "--set-process-arg=--filter-process-name=tomcat"
 
-# Use a proxy for outbound traffic
-"--set-proxy=<proxy.host>:<port>"
+# Send traffic through a corporate proxy
+"--set-proxy=proxy.corp.example.com:8080"
 ```
-See [all installer flags](https://docs.dynatrace.com/docs/ingest-from/dynatrace-oneagent/installation-and-operation/linux/installation/install-oneagent-on-linux).
+
+The full list of installer flags is in
+[Dynatrace's docs](https://docs.dynatrace.com/docs/ingest-from/dynatrace-oneagent/installation-and-operation/linux/installation/install-oneagent-on-linux).
 
 ---
 
-## 6. Common scenarios
+## 6. Scenarios
 
-### Scenario A — Trigger via GitHub Actions UI (manual)
+### Scenario A — Run it from GitHub Actions
 
-1. **Actions** tab → **Deploy Dynatrace OneAgent** → **Run workflow**
-2. Fill in:
-   - **target_hosts**: `srv-app-01.internal` or `["192.168.10.50","192.168.10.51"]`
-   - **runner**: `self-hosted` (if your runner is inside the same network as
-     the targets) or `ubuntu-latest` (if you use a Bastion host)
-   - **installer_flags**: leave default unless you have a reason to change it
-   - **apply_parallelism**: leave at `10` for most cases
-3. Click **Run workflow**
-4. Wait for the **production** approval (if configured in your repo)
+This is the most common setup: a team pushes to `main` (or clicks "Run
+workflow"), and GitHub Actions installs OneAgent on every host in the list.
 
-### Scenario B — Trigger on push to `main`
+**When to use:** you have a team, you want audit logs, and you want
+production changes to require approval.
 
-Set the `TARGET_HOSTS` secret in GitHub (JSON array string). Any push to `main`
-that changes `.tf` or `scripts/**` will plan, then apply with the approval gate.
+#### A.1 — Decide your runner type
 
-### Scenario C — Local apply (no CI)
+GitHub Actions runs your workflow on a "runner" — a virtual machine that
+executes your code. You have two options:
+
+| Runner type | Where it runs | When to pick it |
+|---|---|---|
+| `self-hosted` | A machine **you control**, inside your network | Your targets are on-prem and a self-hosted runner can SSH to them directly. **Pick this for most on-prem setups.** |
+| `ubuntu-latest` | GitHub's cloud | Your targets are reachable over the internet (rare for true on-prem), OR you have a bastion / jump host that the cloud runner can reach. |
+
+For a typical on-prem setup, deploy a self-hosted runner on a VM inside the
+same network as your target servers. See
+[GitHub's docs on self-hosted runners](https://docs.github.com/en/actions/hosting-your-own-runners).
+
+#### A.2 — Configure secrets in GitHub
+
+Go to your repo → **Settings** → **Secrets and variables** → **Actions** →
+**New repository secret**. Add each of these:
+
+| Secret name | What to put | Required? |
+|---|---|---|
+| `DT_ENVIRONMENT_URL` | Your tenant URL, e.g. `https://abc12345.live.dynatrace.com` | ✅ |
+| `DT_PAAS_TOKEN` | PaaS token from Step 2 of the quick start | ✅ |
+| `SSH_USER` | SSH user on targets (e.g. `ubuntu`) | ✅ |
+| `SSH_PRIVATE_KEY` | Full PEM contents of the SSH private key (including the `-----BEGIN/END-----` lines) | ✅ |
+| `TARGET_HOSTS` | JSON array string: `["srv-app-01","192.168.10.50"]` | ✅ (or pass via UI) |
+| `BASTION_HOST` | FQDN/IP of jump host | Only if using a bastion |
+| `BASTION_USER` | SSH user on bastion | Only if using a bastion (defaults to `SSH_USER`) |
+| `BASTION_PRIVATE_KEY` | PEM key for bastion | Only if using a bastion (defaults to `SSH_PRIVATE_KEY`) |
+
+#### A.3 — Set up the production approval gate (one-time)
+
+For safety, require a human to approve `terraform apply` before it runs.
+
+1. GitHub → **Settings** → **Environments** → **New environment** → name it `production`.
+2. Check **Required reviewers** and add yourself and/or your team.
+3. Save.
+
+Now every push to `main` will pause at "Waiting for approval" before applying.
+
+#### A.4 — Trigger an install
+
+**Option 1 — Manual run via the UI:**
+1. Go to the **Actions** tab.
+2. Click **Deploy Dynatrace OneAgent** in the left sidebar.
+3. Click **Run workflow** (top right).
+4. Fill in the inputs:
+   - **target_hosts**: a hostname, or a JSON array of hostnames
+   - **runner**: `self-hosted` (most common for on-prem)
+   - **installer_flags**: leave default unless you need custom flags
+   - **apply_parallelism**: leave at `10`
+5. Click **Run workflow**.
+6. If you set up the approval gate, wait for a reviewer to approve.
+
+**Option 2 — Automatic on push to `main`:**
+- Set the `TARGET_HOSTS` secret (see A.2). Any push to `main` that changes
+  `.tf` files or `scripts/**` will trigger a plan, then apply with approval.
+
+### Scenario B — Auto-run on push to `main`
+
+Already covered above (Option 2 in A.4). In short:
+
+1. Set `TARGET_HOSTS` as a repo secret.
+2. Set the other required secrets.
+3. Push to `main`.
+4. The workflow plans, then waits for approval, then applies.
+
+**Tip:** open a PR first to see the plan in the PR comments before merging.
+
+### Scenario C — Run Terraform locally
+
+Useful for: testing on a single dev host, debugging, or environments where
+GitHub Actions isn't available.
 
 ```bash
 terraform apply
 ```
 
-Useful for: testing on a single dev host, debugging, air-gapped environments
-without internet access from the runner.
+That's it. Terraform reads `terraform.tfvars` and runs the same logic.
 
-### Scenario D — Air-gapped network
+### Scenario D — Air-gapped network (no internet from targets)
 
-If your targets cannot reach `ca.dynatrace.com` AND cannot reach your Dynatrace
-tenant URL:
+Use this when your target servers cannot reach either `ca.dynatrace.com`
+(Dynatrace's certificate host) OR your Dynatrace tenant URL.
 
-1. From an internet-connected machine, download:
-   ```bash
-   curl -fsSL -o dt-root.cert.pem https://ca.dynatrace.com/dt-root.cert.pem
-   curl -fsSL -o Dynatrace-OneAgent-Linux.sh \
-     "https://<DT_URL>/api/v1/deployment/installer/agent/unix/default/latest?Api-Token=<TOKEN>"
-   ```
-2. SCP them to your Terraform runner machine:
-   ```bash
-   scp dt-root.cert.pem Dynatrace-OneAgent-Linux.sh you@runner:~/tf_linux_oneagent/certs/
-   ```
-3. In `terraform.tfvars`:
-   ```hcl
-   local_cert_path        = "./certs/dt-root.cert.pem"
-   local_installer_path   = "./certs/Dynatrace-OneAgent-Linux.sh"
-   verify_signature       = true
-   ```
+**Step 1** — On any internet-connected machine, download the cert and the
+installer:
 
-### Manual (single-host) install
+```bash
+curl -fsSL -o dt-root.cert.pem https://ca.dynatrace.com/dt-root.cert.pem
 
-If you just need OneAgent on one box without any automation:
+curl -fsSL -o Dynatrace-OneAgent-Linux.sh \
+  "https://<DT_URL>/api/v1/deployment/installer/agent/unix/default/latest?Api-Token=<TOKEN>"
+```
+
+**Step 2** — Copy them to the machine that will run Terraform:
+
+```bash
+scp dt-root.cert.pem Dynatrace-OneAgent-Linux.sh you@runner:~/tf_linux_oneagent/certs/
+```
+
+**Step 3** — In `terraform.tfvars`, point Terraform at them:
+
+```hcl
+local_cert_path      = "./certs/dt-root.cert.pem"
+local_installer_path = "./certs/Dynatrace-OneAgent-Linux.sh"
+verify_signature     = true
+```
+
+`terraform apply` will now ship these files to each target instead of
+downloading them.
+
+### Manual one-liner (single host)
+
+If you only need OneAgent on **one** box and you don't want any of this
+automation, skip the whole repo and run this on the target itself:
+
 ```bash
 ssh user@host
 sudo bash -c "$(curl -fsSL \
   'https://<DT_URL>/api/v1/deployment/installer/agent/unix/default/latest?Api-Token=<TOKEN>')"
 ```
-This repo is overkill for that — use the one-liner instead.
+
+This is the simplest possible install. Use it when:
+- You have exactly one host.
+- You'll never need to do this again.
+- You don't need audit logs or approval workflows.
+
+If any of those don't apply, come back and use this repo.
 
 ---
 
@@ -290,135 +434,209 @@ This repo is overkill for that — use the one-liner instead.
 
 | Concern | How we handle it |
 |---|---|
-| **PaaS token at rest** | Stored in GitHub Secrets (encrypted) or `terraform.tfvars` (gitignored). Never in repo. |
-| **PaaS token in transit to target** | Exported in the SSH user's shell env, passed into `sudo` via `--preserve-env=<list>` — never on any process command line. |
-| **PaaS token on target disk** | Never written to disk on the target — env vars live only in the ephemeral shell. |
-| **SSH private key** | Marked `sensitive = true` in Terraform (not printed in plan output). Prefer `file("~/.ssh/...")` over a heredoc in tfvars. |
-| **Installer integrity** | PKCS7 signature verified against `ca.dynatrace.com/dt-root.cert.pem` (or your local copy). |
-| **Production approval** | GitHub Actions `environment: production` blocks `apply` until an approved reviewer clicks through. Configure in **Settings → Environments → production → Required reviewers**. |
-| **Audit trail** | Every apply creates a GitHub Actions run log; state changes are diffable in the PR. |
-| **State file** | Pick a real backend in `versions.tf` (S3 / Azure Blob / GCS / Terraform Cloud). The default `local` backend is fine for solo dev only. |
+| **PaaS token at rest** (sitting in storage) | Stored in GitHub Secrets (encrypted at rest by GitHub) or in `terraform.tfvars` (gitignored). Never in the repo source. |
+| **PaaS token in transit to target** | Exported in the SSH user's shell environment, then handed to `sudo` via `--preserve-env=<list>`. It never appears on any process command line, so even another user on the same box can't see it via `ps`. |
+| **PaaS token on target disk** | Never written to disk on the target. The env vars live only in the ephemeral SSH session. |
+| **SSH private key** | Marked `sensitive = true` in Terraform — Terraform will refuse to print it in plan/apply output. Prefer `file("~/.ssh/...")` in tfvars over a pasted heredoc. |
+| **Installer integrity** | The installer is verified with a PKCS7 cryptographic signature against Dynatrace's root CA cert. If verification fails, the install aborts with no changes made. |
+| **Production approval** | GitHub Actions `environment: production` blocks `terraform apply` until a configured reviewer approves in the GitHub UI. |
+| **Audit trail** | Every apply creates a GitHub Actions run log you can re-read later. State changes show up as PR diffs. |
+| **State file** | By default, Terraform stores state locally — fine for solo dev. For team use, configure a real backend (S3 / Azure Blob / GCS / Terraform Cloud) — examples are in `versions.tf`. |
 
-### Sudo hardening (recommended)
+### Recommended: harden sudo on every target
 
-In `/etc/sudoers.d/dynatrace-deploy` on each target:
-```sudoers
+Out of the box, this repo needs the SSH user to be able to run `sudo bash ...`
+without a password. You can lock this down much further by restricting sudo to
+**only** run the install script:
+
+Create `/etc/sudoers.d/dynatrace-deploy` on each target with:
+
+```
 Defaults:ubuntu env_keep += "DT_ENV_URL DT_PAAS_TOKEN DT_ARCH DT_INSTALLER_FLAGS DT_VERIFY_SIGNATURE DT_CERT_PATH DT_LOCAL_INSTALLER"
 ubuntu ALL=(root) NOPASSWD: /bin/bash /tmp/install_oneagent.sh
 ```
-This restricts the SSH user to running **only** the install script as root,
-which dramatically reduces blast radius if the SSH key is ever compromised.
+
+Now if the SSH key is ever compromised, the attacker can only run the
+installer — not arbitrary commands as root.
 
 ---
 
-## 8. Operations & troubleshooting
+## 8. Operations and troubleshooting
 
 ### Uninstall OneAgent from a host
+
 ```bash
 ssh user@host
 sudo /opt/dynatrace/oneagent/agent/uninstall.sh
 ```
-> We don't yet have a Terraform flow for uninstall. PRs welcome.
+
+> This repo doesn't yet have a Terraform-managed uninstall flow. PRs welcome.
 
 ### "Pre-flight: verifying passwordless sudo ... failed"
-The SSH user can't `sudo` without a password. Fix the sudoers file on the target:
+
+The SSH user can't run `sudo` without a password.
+
+**Fix:** add a NOPASSWD rule for your user:
+
 ```bash
 echo "ubuntu ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/ubuntu-nopasswd
 ```
-Then re-apply.
+
+Then re-run `terraform apply`.
 
 ### "Failed to download installer from <DT_URL>"
-- Check the target can reach the tenant URL: `curl -fsSL <DT_URL>`
-- Check the PaaS token is valid and not expired in the Dynatrace UI
-- If the target is air-gapped, set `local_installer_path`
+
+Walk through these in order:
+
+1. **Can the target reach the URL?** From the target:
+   ```bash
+   curl -fsSL https://<DT_URL>
+   ```
+   If this fails, the target can't reach Dynatrace — see [Scenario D](#scenario-d--air-gapped-network-no-internet-from-targets).
+
+2. **Is the PaaS token valid?** Log into your Dynatrace tenant → **Access
+   management** → **Tokens**. Check the token is active and not expired.
+
+3. **Does the token have the right scope?** The token needs the `PaaS
+   integration` scope to download installers.
 
 ### "Installer signature verification FAILED"
-- The tenant URL is wrong, the cert is stale, or the installer was tampered with. Do NOT proceed.
-- If air-gapped, ensure `local_cert_path` points to the cert you downloaded
-  from the **same tenant** you're installing for
+
+This is a serious error — do not proceed.
+
+Possible causes:
+- The tenant URL is wrong.
+- The certificate is stale or wrong.
+- The installer was tampered with (unlikely but possible).
+
+**Fix:**
+1. If you set `local_cert_path`, make sure the cert you downloaded matches your tenant.
+2. If you're in an air-gapped env, re-download both the cert and the installer
+   from the same tenant and re-stage them.
+3. If the error persists, contact your Dynatrace admin.
 
 ### "OneAgent service is active — skipping install."
-Expected behaviour — the resource is idempotent. To force a reinstall,
-update a `triggers` value in `main.tf` (e.g. bump a comment in the script so
-its SHA changes).
 
-### Host shows up but never sends data
-1. On the target: `systemctl status oneagent` — is it running?
-2. On the target: `journalctl -u oneagent --since "10 min ago"` — any errors?
-3. From an external host: `curl https://<DT_URL>/api/v1/entities?entitySelector=type(HOST)` —
-   is the host registered?
-4. Check outbound connectivity on port 443 to your tenant URL.
+**This is normal.** It means OneAgent is already running on this host and
+the script is correctly avoiding a re-install.
 
-### I changed `target_hosts` but Terraform says "no changes"
-You added a host that wasn't in `target_hosts` before? It should show
-`null_resource.oneagent["new-host"]: Creating...`. If not, double-check the
-syntax — Terraform is sensitive to trailing commas in lists.
+To force a reinstall, edit `main.tf` and bump the `script_sha` trigger (any
+change to the install script will do).
+
+### Host shows up in Dynatrace but never sends data
+
+Walk through these in order:
+
+1. **Is the agent running on the host?**
+   ```bash
+   ssh user@host systemctl status oneagent
+   # Expected: Active: active (running)
+   ```
+
+2. **Are there errors in the logs?**
+   ```bash
+   ssh user@host journalctl -u oneagent --since "10 min ago"
+   ```
+
+3. **Can the host reach the tenant URL on port 443?**
+   ```bash
+   ssh user@host curl -fsSL https://<DT_URL>
+   ```
+
+4. **Is the host registered?**
+   From any machine with API access:
+   ```bash
+   curl -fsSL -H "Authorization: Api-Token <TOKEN>" \
+     "https://<DT_URL>/api/v1/entities?entitySelector=type(HOST)"
+   ```
+
+### I added a host to `target_hosts` but Terraform says "no changes"
+
+Checklist:
+- Did you save `terraform.tfvars`?
+- Is the host on a new line with proper quoting? E.g.
+  `target_hosts = ["srv-a", "srv-b"]`, not `target_hosts = ["srv-a",]`.
+- Did you run `terraform apply` (not just `plan`)?
+- Run `terraform plan` first — it should show the new host as
+  `null_resource.oneagent["new-host"]: Creating...`.
 
 ### "Error: Saved plan is stale"
-State was modified by someone else. Re-run `terraform plan` to refresh.
 
-### Re-running a failed apply
-`terraform apply` is safe to re-run. Failed hosts will be retried; successful
-hosts will be skipped (idempotency).
+Someone else ran Terraform (or the state file was modified externally)
+between your `plan` and `apply`. **Just re-run `terraform plan`** and try again.
+
+### Re-running a failed `apply`
+
+Always safe. Terraform re-creates only the resources that failed.
+Already-successful hosts are skipped (the install script's idempotency
+check).
+
+### I need to add a new host
+
+```bash
+# Edit terraform.tfvars
+$EDITOR terraform.tfvars    # add the new host to target_hosts
+
+terraform plan              # preview the change
+terraform apply             # do it
+```
+
+If you're using GitHub Actions, push the change to a branch, open a PR (you'll
+see the plan in the PR comments), merge, and approve the production gate.
+
+### I need to remove a host
+
+Remove the host from `target_hosts` and run `terraform apply`. The
+`null_resource` for that host is destroyed, but OneAgent itself is **not**
+uninstalled from the host — you'll need to
+[uninstall it manually](#uninstall-oneagent-from-a-host) if you want it gone.
 
 ---
 
 ## 9. FAQ
 
-**Q: Does this work on Windows targets?**
-A: No — Dynatrace provides a separate Windows installer. This repo only handles
-Linux.
+**Q: Does this work on Windows servers?**
+A: No — Dynatrace has a separate Windows installer and a different install
+mechanism. This repo only handles Linux.
 
 **Q: Can I use this for Kubernetes nodes?**
-A: Not recommended. Use the [Dynatrace Operator + DynaKube](https://docs.dynatrace.com/docs/ingest-from/dynatrace-oneagent/installation-and-operation/kubernetes)
-approach for clusters.
+A: Not recommended. For Kubernetes, use the
+[Dynatrace Operator + DynaKube](https://docs.dynatrace.com/docs/ingest-from/dynatrace-oneagent/installation-and-operation/kubernetes)
+approach. It's purpose-built for cluster-aware monitoring.
 
-**Q: Why not just `apt install dynatrace-oneagent`?**
-A: You'd still need to register the agent with the tenant. This repo handles
-both download AND registration in one shot.
+**Q: Why not just `apt install dynatrace-oneagent` (or `yum install oneagent`)?**
+A: Because installing the package is only half the job — the agent also
+needs to know which tenant to report to. Our script handles both the
+download AND the registration in one shot.
 
-**Q: Can I run this from a laptop sitting on a different network?**
-A: Only if the laptop can reach both the tenant URL (for downloading the
-installer) and the targets (or via Bastion). Otherwise use the GitHub Actions
-runner or a self-hosted runner inside the target network.
+**Q: Why are we using `null_resource` and not a real Terraform provider?**
+A: There is no Terraform provider for "install software on an arbitrary
+SSH-reachable Linux host". `null_resource` + provisioners is the standard
+idiom for this kind of task in Terraform.
 
-**Q: Why `null_resource` instead of an actual provider?**
-A: There's no first-class Terraform provider for "install software on an
-arbitrary SSH-reachable Linux host". `null_resource` + provisioners is the
-idiomatic Terraform pattern for this.
-
-**Q: Can I get a Slack notification when an apply fails?**
-A: Add a Slack notification step to `.github/workflows/deploy.yml`. There are
-many community actions for this (e.g. `slackapi/slack-github-action`).
+**Q: Can I run this from my laptop when I'm at home?**
+A: Only if your laptop can reach both your Dynatrace tenant (to download
+the installer) and your target servers (or a bastion). For most on-prem
+setups, the safest path is to use a self-hosted runner inside the network.
 
 **Q: Where do I see what `apply_parallelism` should be?**
-A: Default 10 is conservative. Watch your Dynatrace tenant rate limits
-(host ingest rate) — bump down if you see 429s.
+A: The default (10) is conservative and works for most teams. If you have
+hundreds of hosts, you can bump it up. If your Dynatrace tenant has strict
+rate limits and you see 429 errors, lower it. The right value depends on
+your tenant's ingest limits — ask your Dynatrace admin if unsure.
 
----
+**Q: Can I get a Slack/Teams notification when an apply fails?**
+A: Yes — add a notification step (like `slackapi/slack-github-action`) to
+`.github/workflows/deploy.yml`. Not configured out of the box because each
+team has different chat tools.
 
-## 10. Glossary
+**Q: The hosts in my `target_hosts` list have different CPU architectures
+(some x86, some ARM). Can I run them in one apply?**
+A: Not currently. The `arch` variable is global to one apply. Either run
+two applies (one per architecture), or refactor `main.tf` to take a map of
+`host → arch`. Noted as a future improvement.
 
-- **OneAgent** — Dynatrace's per-host agent. Collects host, process, and
-  application telemetry.
-- **Full-stack** — OneAgent monitors infrastructure AND application code
-  (requires `--set-infra-only=false`, the default).
-- **Infrastructure-only** — OneAgent only monitors the host metrics, no
-  code-level tracing (`--set-infra-only=true`).
-- **PaaS token** — Dynatrace API token with `PaaS integration` scope. Used to
-  download the installer. Rotated in **Access management → Tokens**.
-- **Environment URL** — Your tenant's web URL. For SaaS it's
-  `<ID>.live.dynatrace.com`; for Managed it's your cluster's URL.
-- **ActiveGate** — Dynatrace's on-prem relay that hosts OneAgent installer
-  downloads when the cluster is fully air-gapped. Set `dt_environment_url`
-  to the ActiveGate URL instead of the SaaS URL.
-- **Bastion / Jump host** — An SSH proxy used to reach hosts on a private
-  network from a runner outside that network.
-- **Idempotent** — Re-running the operation is safe and produces no change if
-  the desired state is already in place.
-- **PKCS7 signature** — Cryptographic signature format Dynatrace uses on
-  their installer. Verification ensures the bytes you downloaded are exactly
-  the bytes Dynatrace published.
-- **`null_resource`** — A Terraform resource that does nothing on its own but
-  lets you attach provisioners (file / remote-exec / local-exec). The standard
-  idiom for "Terraform does X" where X has no native provider.
+**Q: Who do I ask if I'm stuck?**
+A: Open an issue in this repo or ping the `#platform` channel on Slack.
+Include the error message, the host you're trying to install on, and the
+output of `terraform plan`.
