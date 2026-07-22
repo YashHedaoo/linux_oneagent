@@ -4,17 +4,16 @@ on:
   push:
     branches: [main]
     paths:
-      - "**.tf"
       - "scripts/**"
       - ".github/workflows/deploy.yml"
   pull_request:
     paths:
-      - "**.tf"
       - "scripts/**"
+      - ".github/workflows/deploy.yml"
   workflow_dispatch:
     inputs:
       target_hosts:
-        description: 'Server Hostname(s) or IP(s) to install on (e.g. srv-app-01.internal or ["192.168.1.10","192.168.1.11"]). Leave blank to use TARGET_HOSTS secret.'
+        description: 'Server Hostname(s) or IP(s) to install on (e.g. srv-app-01.internal or 192.168.1.10,192.168.1.11). Leave blank to use TARGET_HOSTS secret.'
         required: false
         type: string
         default: ''
@@ -31,17 +30,12 @@ on:
         required: false
         type: string
         default: '--set-infra-only=false --set-app-log-content-access=true'
-      apply_parallelism:
-        description: 'Max hosts to install on in parallel (1-50).'
-        required: false
-        type: number
-        default: 10
 
 permissions:
   contents: read
 
 jobs:
-  terraform:
+  deploy:
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
 
     # Protect prod with a manual approval gate. Configure required reviewers
@@ -51,65 +45,43 @@ jobs:
       url: https://app.dynatrace.com
 
     env:
-      TF_VAR_dt_environment_url: ${{ secrets.DT_ENVIRONMENT_URL }}
-      TF_VAR_dt_paas_token: ${{ secrets.DT_PAAS_TOKEN }}
-      TF_VAR_ssh_user: ${{ secrets.SSH_USER || 'ubuntu' }}
-      TF_VAR_ssh_private_key: ${{ secrets.SSH_PRIVATE_KEY }}
-      TF_VAR_bastion_host: ${{ secrets.BASTION_HOST }}
-      TF_VAR_bastion_user: ${{ secrets.BASTION_USER }}
-      TF_VAR_bastion_private_key: ${{ secrets.BASTION_PRIVATE_KEY }}
-      TF_VAR_apply_parallelism: ${{ inputs.apply_parallelism || 10 }}
+      DT_PAAS_TOKEN: ${{ secrets.DT_PAAS_TOKEN }}
+      ARTIFACTORY_URL: ${{ secrets.ARTIFACTORY_URL }}
+      ARTIFACTORY_TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
+      SSH_USER: ${{ secrets.SSH_USER || 'ubuntu' }}
+      BASTION_HOST: ${{ secrets.BASTION_HOST }}
+      BASTION_USER: ${{ secrets.BASTION_USER || secrets.SSH_USER || 'ubuntu' }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: "1.9.5"
+      - name: Set up SSH Private Key
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        if: ${{ env.SSH_PRIVATE_KEY != '' }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          echo "SSH_PRIVATE_KEY_PATH=~/.ssh/id_rsa" >> $GITHUB_ENV
 
-      - name: Parse Target Hosts & Inputs
+      - name: Deploy Dynatrace OneAgent via SSH
+        if: github.event_name != 'pull_request'
         run: |
           INPUT_HOSTS="${{ inputs.target_hosts }}"
           SECRET_HOSTS='${{ secrets.TARGET_HOSTS }}'
-          RAW_HOSTS="${INPUT_HOSTS:-$SECRET_HOSTS}"
+          TARGET_HOSTS="${INPUT_HOSTS:-$SECRET_HOSTS}"
 
-          if [ -z "$RAW_HOSTS" ]; then
+          if [ -z "$TARGET_HOSTS" ]; then
             echo "Error: No target hosts specified in workflow input or TARGET_HOSTS secret!"
             exit 1
           fi
 
-          # Format plain hostname or comma-separated list into JSON array if needed
-          if [[ "$RAW_HOSTS" != \[* ]]; then
-            CLEAN_JSON=$(echo "$RAW_HOSTS" | awk -F',' '{for(i=1;i<=NF;i++){gsub(/^[ \t]+|[ \t]+$/, "", $i); printf "%s\"%s\"", (i==1?"":", "), $i}}')
-            RAW_HOSTS="[$CLEAN_JSON]"
-          fi
-
-          echo "Target Hosts: $RAW_HOSTS"
-          echo "TF_VAR_target_hosts=$RAW_HOSTS" >> $GITHUB_ENV
-
+          export TARGET_HOSTS
           if [ -n "${{ inputs.installer_flags }}" ]; then
-            echo "TF_VAR_installer_flags=${{ inputs.installer_flags }}" >> $GITHUB_ENV
+            export DT_INSTALLER_FLAGS="${{ inputs.installer_flags }}"
           fi
 
-      - name: Terraform Init
-        run: terraform init -input=false
-
-      - name: Terraform Format Check
-        run: terraform fmt -check -recursive
-
-      - name: Terraform Validate
-        run: terraform validate
-
-      - name: Terraform Plan
-        run: terraform plan -input=false -no-color -lock-timeout=5m
-
-      # Only apply on pushes to main or manual workflow_dispatch triggers.
-      # Pull requests always stop after plan. Production approval gate is
-      # enforced via the job-level `environment: production` above.
-      - name: Terraform Apply
-        if: github.event_name != 'pull_request'
-        run: |
-          PARALLELISM="${{ env.TF_VAR_apply_parallelism || 10 }}"
-          terraform apply -auto-approve -input=false -no-color -lock-timeout=5m -parallelism=${PARALLELISM}
+          ./scripts/deploy.sh
